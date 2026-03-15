@@ -12,7 +12,8 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AdaptiveConcurrency {
 
-Http::FilterFactoryCb AdaptiveConcurrencyFilterFactory::createFilterFactory(
+namespace {
+Http::FilterFactoryCb createFilterFactory(
     const envoy::extensions::filters::http::adaptive_concurrency::v3::AdaptiveConcurrency& config,
     const std::string& stats_prefix, Server::Configuration::ServerFactoryContext& server_context,
     Stats::Scope& scope) {
@@ -39,12 +40,30 @@ Http::FilterFactoryCb AdaptiveConcurrencyFilterFactory::createFilterFactory(
         std::make_shared<AdaptiveConcurrencyFilter>(filter_config, controller));
   };
 }
+} // namespace
+
+absl::StatusOr<Http::FilterFactoryCb>
+AdaptiveConcurrencyFilterFactory::createFilterFactoryFromProtoTyped(
+    const envoy::extensions::filters::http::adaptive_concurrency::v3::AdaptiveConcurrency& config,
+    const std::string& stats_prefix, DualInfo info,
+    Server::Configuration::ServerFactoryContext& context) {
+  return createFilterFactory(config, stats_prefix, context, info.scope);
+}
+
+Envoy::Http::FilterFactoryCb
+AdaptiveConcurrencyFilterFactory::createFilterFactoryFromProtoWithServerContextTyped(
+    const envoy::extensions::filters::http::adaptive_concurrency::v3::AdaptiveConcurrency& config,
+    const std::string& stats_prefix, Server::Configuration::ServerFactoryContext& context) {
+  return createFilterFactory(config, stats_prefix, context, context.scope());
+}
 
 /**
  * Static registration for the adaptive_concurrency filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(AdaptiveConcurrencyFilterFactory,
-                 Server::Configuration::NamedHttpFilterConfigFactory);
+LEGACY_REGISTER_FACTORY(AdaptiveConcurrencyFilterFactory,
+                        Server::Configuration::NamedHttpFilterConfigFactory);
+LEGACY_REGISTER_FACTORY(UpstreamAdaptiveConcurrencyFilterFactory,
+                        Server::Configuration::UpstreamHttpFilterConfigFactory);
 
 } // namespace AdaptiveConcurrency
 } // namespace HttpFilters
