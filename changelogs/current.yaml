@@ -257,6 +257,14 @@ removed_config_or_runtime:
 # *Normally occurs at the end of the* :ref:`deprecation period <deprecated>`
 
 new_features:
+- area: admission_control
+  change: |
+    Added per-route configuration support to the :ref:`admission control filter
+    <config_http_filters_admission_control>`. The filter now supports
+    :ref:`AdmissionControlPerRoute
+    <envoy_v3_api_msg_extensions.filters.http.admission_control.v3.AdmissionControlPerRoute>`
+    via ``typed_per_filter_config`` on routes and virtual hosts, allowing overriding decision
+    parameters (aggression, thresholds, success criteria) or disabling the filter per route.
 - area: filters
   change: |
     Added filters to update the filter state in :ref:`a listener filter <config_listener_filters_set_filter_state>`.

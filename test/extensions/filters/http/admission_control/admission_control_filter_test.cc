@@ -650,7 +650,6 @@ admission_control:
   Http::TestRequestHeaderMapImpl request_headers;
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
 
-  // The per-route evaluator should be used, not the global one.
   EXPECT_CALL(*per_route_evaluator, isHttpSuccess(200)).WillOnce(Return(true));
   EXPECT_CALL(*evaluator_, isHttpSuccess(200)).Times(0);
   sampleHttpRequest("200");

@@ -51,8 +51,18 @@ Note that there are additional parameters that affect the rejection probability:
 .. note::
    Health check traffic does not count towards any of the filter's measurements.
 
-.. note::
-   Only non-route-specific virtual host configurations are supported.
+Per-Route Configuration
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The admission control filter supports per-route configuration via
+:ref:`typed_per_filter_config <envoy_v3_api_field_config.route.v3.VirtualHost.typed_per_filter_config>`.
+Per-route configuration allows overriding the filter's decision parameters (aggression, thresholds,
+max rejection probability, and success criteria) or disabling the filter entirely for specific
+routes or virtual hosts. The thread-local success-rate tracking is shared across all routes.
+
+See the :ref:`per-route API reference
+<envoy_v3_api_msg_extensions.filters.http.admission_control.v3.AdmissionControlPerRoute>` for
+configuration details.
 
 See the :ref:`v3 API reference
 <envoy_v3_api_msg_extensions.filters.http.admission_control.v3.AdmissionControl>` for more

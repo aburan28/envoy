@@ -73,8 +73,6 @@ double AdmissionControlFilterConfig::maxRejectionProbability() const {
   return ret / 100.0;
 }
 
-// --- Per-route config ---
-
 AdmissionControlPerRouteFilterConfig::AdmissionControlPerRouteFilterConfig(
     const AdmissionControlPerRouteProto& proto_config, Runtime::Loader& runtime,
     std::shared_ptr<ResponseEvaluator> response_evaluator)
@@ -127,8 +125,6 @@ double AdmissionControlPerRouteFilterConfig::maxRejectionProbability() const {
                                                 : defaultMaxRejectionProbability;
   return ret / 100.0;
 }
-
-// --- Filter ---
 
 AdmissionControlFilter::AdmissionControlFilter(AdmissionControlFilterConfigSharedPtr config,
                                                const std::string& stats_prefix)
