@@ -76,9 +76,35 @@ absl::StatusOr<Http::FilterFactoryCb> AdmissionControlFilterFactory::createFilte
   };
 }
 
-/**
- * Static registration for the admission_control filter. @see RegisterFactory.
- */
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+AdmissionControlFilterFactory::createRouteSpecificFilterConfigTyped(
+    const envoy::extensions::filters::http::admission_control::v3::AdmissionControlPerRoute&
+        proto_config,
+    Server::Configuration::ServerFactoryContext& context, ProtobufMessage::ValidationVisitor&) {
+  std::shared_ptr<ResponseEvaluator> response_evaluator;
+  if (proto_config.has_admission_control()) {
+    const auto& ac = proto_config.admission_control();
+    if (ac.has_sr_threshold() && ac.sr_threshold().default_value().value() < 1.0) {
+      return absl::InvalidArgumentError(
+          "Per-route success rate threshold cannot be less than 1.0%.");
+    }
+
+    switch (ac.evaluation_criteria_case()) {
+    case AdmissionControlProto::EvaluationCriteriaCase::kSuccessCriteria: {
+      auto evaluator_or = SuccessCriteriaEvaluator::create(ac.success_criteria());
+      RETURN_IF_NOT_OK(evaluator_or.status());
+      response_evaluator = std::move(evaluator_or.value());
+      break;
+    }
+    case AdmissionControlProto::EvaluationCriteriaCase::EVALUATION_CRITERIA_NOT_SET:
+      break;
+    }
+  }
+
+  return std::make_shared<AdmissionControlPerRouteFilterConfig>(proto_config, context.runtime(),
+                                                                std::move(response_evaluator));
+}
+
 REGISTER_FACTORY(AdmissionControlFilterFactory,
                  Server::Configuration::NamedHttpFilterConfigFactory);
 REGISTER_FACTORY(UpstreamAdmissionControlFilterFactory,

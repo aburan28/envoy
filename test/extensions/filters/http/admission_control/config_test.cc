@@ -254,6 +254,105 @@ success_criteria:
   cb(callbacks);
 }
 
+// Verify per-route config creation with disabled flag.
+TEST_F(AdmissionControlConfigTest, PerRouteConfigDisabled) {
+  AdmissionControlFilterFactory admission_control_filter_factory;
+
+  envoy::extensions::filters::http::admission_control::v3::AdmissionControlPerRoute per_route;
+  per_route.set_disabled(true);
+
+  auto result = admission_control_filter_factory.createRouteSpecificFilterConfig(
+      per_route, context_.serverFactoryContext(),
+      context_.server_factory_context_.messageValidationVisitor());
+  EXPECT_TRUE(result.ok());
+  EXPECT_NE(nullptr, result.value());
+}
+
+// Verify per-route config creation with admission control override.
+TEST_F(AdmissionControlConfigTest, PerRouteConfigOverride) {
+  AdmissionControlFilterFactory admission_control_filter_factory;
+
+  const std::string yaml = R"EOF(
+admission_control:
+  aggression:
+    default_value: 2.0
+    runtime_key: "per_route.aggression"
+  sr_threshold:
+    default_value:
+      value: 90.0
+    runtime_key: "per_route.sr_threshold"
+  rps_threshold:
+    default_value: 10
+    runtime_key: "per_route.rps_threshold"
+  max_rejection_probability:
+    default_value:
+      value: 50.0
+    runtime_key: "per_route.max_rejection_probability"
+  success_criteria:
+    http_criteria:
+    grpc_criteria:
+)EOF";
+
+  envoy::extensions::filters::http::admission_control::v3::AdmissionControlPerRoute per_route;
+  TestUtility::loadFromYaml(yaml, per_route);
+
+  auto result = admission_control_filter_factory.createRouteSpecificFilterConfig(
+      per_route, context_.serverFactoryContext(),
+      context_.server_factory_context_.messageValidationVisitor());
+  EXPECT_TRUE(result.ok());
+  EXPECT_NE(nullptr, result.value());
+}
+
+// Verify per-route config rejects sr_threshold below 1.0%.
+TEST_F(AdmissionControlConfigTest, PerRouteConfigBadSrThreshold) {
+  AdmissionControlFilterFactory admission_control_filter_factory;
+
+  const std::string yaml = R"EOF(
+admission_control:
+  sr_threshold:
+    default_value:
+      value: 0.5
+    runtime_key: "per_route.sr_threshold"
+  success_criteria:
+    http_criteria:
+    grpc_criteria:
+)EOF";
+
+  envoy::extensions::filters::http::admission_control::v3::AdmissionControlPerRoute per_route;
+  TestUtility::loadFromYaml(yaml, per_route);
+
+  auto result = admission_control_filter_factory.createRouteSpecificFilterConfig(
+      per_route, context_.serverFactoryContext(),
+      context_.server_factory_context_.messageValidationVisitor());
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ("Per-route success rate threshold cannot be less than 1.0%.",
+            result.status().message());
+}
+
+// Verify per-route config with minimal override still requires success_criteria.
+TEST_F(AdmissionControlConfigTest, PerRouteConfigMinimalOverride) {
+  AdmissionControlFilterFactory admission_control_filter_factory;
+
+  const std::string yaml = R"EOF(
+admission_control:
+  aggression:
+    default_value: 2.0
+    runtime_key: "per_route.aggression"
+  success_criteria:
+    http_criteria:
+    grpc_criteria:
+)EOF";
+
+  envoy::extensions::filters::http::admission_control::v3::AdmissionControlPerRoute per_route;
+  TestUtility::loadFromYaml(yaml, per_route);
+
+  auto result = admission_control_filter_factory.createRouteSpecificFilterConfig(
+      per_route, context_.serverFactoryContext(),
+      context_.server_factory_context_.messageValidationVisitor());
+  EXPECT_TRUE(result.ok());
+  EXPECT_NE(nullptr, result.value());
+}
+
 } // namespace
 } // namespace AdmissionControl
 } // namespace HttpFilters

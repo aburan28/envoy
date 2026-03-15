@@ -19,6 +19,23 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // [#protodoc-title: Admission Control]
 // [#extension: envoy.filters.http.admission_control]
 
+// Per-route configuration for the admission control filter. Allows overriding
+// the filter behavior on a per-route, per-virtual-host, or per-route-configuration basis.
+message AdmissionControlPerRoute {
+  oneof override {
+    option (validate.required) = true;
+
+    // Disable the admission control filter for this route.
+    bool disabled = 1 [(validate.rules).bool = {const: true}];
+
+    // Override the global admission control configuration for this route.
+    // The thread-local success-rate tracking is shared with the global filter
+    // configuration; only the decision parameters (aggression, thresholds, etc.)
+    // and success criteria can be overridden per route.
+    AdmissionControl admission_control = 2;
+  }
+}
+
 // [#next-free-field: 8]
 message AdmissionControl {
   // Default method of specifying what constitutes a successful request. All status codes that

@@ -83,6 +83,38 @@ private:
 
 using AdmissionControlFilterConfigSharedPtr = std::shared_ptr<const AdmissionControlFilterConfig>;
 
+using AdmissionControlPerRouteProto =
+    envoy::extensions::filters::http::admission_control::v3::AdmissionControlPerRoute;
+
+/**
+ * Per-route configuration for the admission control filter.
+ * Allows overriding decision parameters and success criteria on a per-route basis
+ * while sharing the global thread-local success-rate tracking.
+ */
+class AdmissionControlPerRouteFilterConfig : public Router::RouteSpecificFilterConfig {
+public:
+  AdmissionControlPerRouteFilterConfig(const AdmissionControlPerRouteProto& proto_config,
+                                       Runtime::Loader& runtime,
+                                       std::shared_ptr<ResponseEvaluator> response_evaluator);
+
+  bool disabled() const { return disabled_; }
+  bool filterEnabled() const;
+  double aggression() const;
+  double successRateThreshold() const;
+  uint32_t rpsThreshold() const;
+  double maxRejectionProbability() const;
+  ResponseEvaluator* responseEvaluator() const { return response_evaluator_.get(); }
+
+private:
+  const bool disabled_;
+  std::unique_ptr<Runtime::FeatureFlag> admission_control_feature_;
+  std::unique_ptr<Runtime::Double> aggression_;
+  std::unique_ptr<Runtime::Percentage> sr_threshold_;
+  std::unique_ptr<Runtime::UInt32> rps_threshold_;
+  std::unique_ptr<Runtime::Percentage> max_rejection_probability_;
+  std::shared_ptr<ResponseEvaluator> response_evaluator_;
+};
+
 /**
  * A filter that probabilistically rejects requests based on upstream success-rate.
  */
@@ -107,6 +139,13 @@ private:
 
   bool shouldRejectRequest() const;
 
+  bool resolvedFilterEnabled() const;
+  double resolvedAggression() const;
+  double resolvedSuccessRateThreshold() const;
+  uint32_t resolvedRpsThreshold() const;
+  double resolvedMaxRejectionProbability() const;
+  ResponseEvaluator& resolvedResponseEvaluator() const;
+
   void recordSuccess() {
     stats_.rq_success_.inc();
     config_->getController().recordSuccess();
@@ -118,6 +157,7 @@ private:
   }
 
   const AdmissionControlFilterConfigSharedPtr config_;
+  const AdmissionControlPerRouteFilterConfig* per_route_config_{nullptr};
   AdmissionControlStats stats_;
   bool expect_grpc_status_in_trailer_{false};
 

@@ -473,6 +473,234 @@ success_criteria:
   verifyProbabilities(0, 0.1);
 }
 
+// Verify per-route config can disable the filter.
+TEST_F(AdmissionControlTest, PerRouteDisabled) {
+  auto config = makeConfig(default_yaml_);
+  setupFilter(config);
+
+  AdmissionControlPerRouteProto per_route_proto;
+  per_route_proto.set_disabled(true);
+  AdmissionControlPerRouteFilterConfig per_route_config(per_route_proto, runtime_, nullptr);
+
+  EXPECT_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+      .WillRepeatedly(Return(&per_route_config));
+
+  EXPECT_CALL(controller_, requestCounts()).Times(0);
+  EXPECT_CALL(controller_, averageRps()).Times(0);
+
+  Http::TestRequestHeaderMapImpl request_headers;
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+}
+
+// Verify per-route config can override aggression and sr_threshold.
+TEST_F(AdmissionControlTest, PerRouteOverrideAggression) {
+  auto config = makeConfig(default_yaml_);
+  setupFilter(config);
+
+  AdmissionControlPerRouteProto per_route_proto;
+  TestUtility::loadFromYaml(R"EOF(
+admission_control:
+  aggression:
+    default_value: 2.0
+    runtime_key: "per_route.aggression"
+  sr_threshold:
+    default_value:
+      value: 100.0
+    runtime_key: "per_route.threshold"
+  max_rejection_probability:
+    default_value:
+      value: 100.0
+    runtime_key: "per_route.max_rejection_probability"
+  success_criteria:
+    http_criteria:
+    grpc_criteria:
+)EOF",
+                            per_route_proto);
+
+  auto per_route_evaluator = std::make_shared<MockResponseEvaluator>();
+  AdmissionControlPerRouteFilterConfig per_route_config(per_route_proto, runtime_,
+                                                        per_route_evaluator);
+
+  EXPECT_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+      .WillRepeatedly(Return(&per_route_config));
+  EXPECT_CALL(controller_, averageRps()).WillRepeatedly(Return(99));
+  EXPECT_CALL(*per_route_evaluator, isGrpcSuccess(0)).WillRepeatedly(Return(true));
+
+  constexpr int total_request_count = 100;
+  EXPECT_CALL(controller_, requestCounts())
+      .WillRepeatedly(Return(RequestData(total_request_count, 95)));
+
+  Http::TestRequestHeaderMapImpl request_headers;
+  uint32_t rejection_count = 0;
+  const auto accuracy = 1e4;
+  for (int i = 0; i < accuracy; ++i) {
+    EXPECT_CALL(random_, random()).WillRepeatedly(Return(i));
+    if (filter_->decodeHeaders(request_headers, true) != Http::FilterHeadersStatus::Continue) {
+      ++rejection_count;
+    }
+  }
+
+  // With aggression=2.0 and sr_threshold=100%, at 95% success rate, expect ~22% rejection
+  // (higher than the ~5% we'd get with aggression=1.0).
+  EXPECT_NEAR(static_cast<double>(rejection_count) / accuracy, 0.22, 0.02);
+}
+
+// Verify per-route config can override the RPS threshold.
+TEST_F(AdmissionControlTest, PerRouteRpsThreshold) {
+  auto config = makeConfig(default_yaml_);
+  setupFilter(config);
+
+  AdmissionControlPerRouteProto per_route_proto;
+  TestUtility::loadFromYaml(R"EOF(
+admission_control:
+  rps_threshold:
+    default_value: 1000
+    runtime_key: "per_route.rps_threshold"
+  success_criteria:
+    http_criteria:
+    grpc_criteria:
+)EOF",
+                            per_route_proto);
+
+  AdmissionControlPerRouteFilterConfig per_route_config(per_route_proto, runtime_, nullptr);
+
+  EXPECT_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+      .WillRepeatedly(Return(&per_route_config));
+  EXPECT_CALL(controller_, averageRps()).WillRepeatedly(Return(500));
+  EXPECT_CALL(controller_, requestCounts()).Times(0);
+
+  Http::TestRequestHeaderMapImpl request_headers;
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+}
+
+// Verify per-route config with different max rejection probability.
+TEST_F(AdmissionControlTest, PerRouteMaxRejectionProbability) {
+  auto config = makeConfig(default_yaml_);
+  setupFilter(config);
+
+  AdmissionControlPerRouteProto per_route_proto;
+  TestUtility::loadFromYaml(R"EOF(
+admission_control:
+  sr_threshold:
+    default_value:
+      value: 100.0
+    runtime_key: "per_route.threshold"
+  max_rejection_probability:
+    default_value:
+      value: 10.0
+    runtime_key: "per_route.max_rejection_probability"
+  success_criteria:
+    http_criteria:
+    grpc_criteria:
+)EOF",
+                            per_route_proto);
+
+  auto per_route_evaluator = std::make_shared<MockResponseEvaluator>();
+  AdmissionControlPerRouteFilterConfig per_route_config(per_route_proto, runtime_,
+                                                        per_route_evaluator);
+
+  EXPECT_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+      .WillRepeatedly(Return(&per_route_config));
+  EXPECT_CALL(controller_, averageRps()).WillRepeatedly(Return(99));
+  EXPECT_CALL(*per_route_evaluator, isGrpcSuccess(0)).WillRepeatedly(Return(true));
+
+  constexpr int total_request_count = 100;
+  EXPECT_CALL(controller_, requestCounts())
+      .WillRepeatedly(Return(RequestData(total_request_count, 0)));
+
+  Http::TestRequestHeaderMapImpl request_headers;
+  uint32_t rejection_count = 0;
+  const auto accuracy = 1e4;
+  for (int i = 0; i < accuracy; ++i) {
+    EXPECT_CALL(random_, random()).WillRepeatedly(Return(i));
+    if (filter_->decodeHeaders(request_headers, true) != Http::FilterHeadersStatus::Continue) {
+      ++rejection_count;
+    }
+  }
+
+  // Even with 0% success rate, rejection probability should be capped at 10%.
+  EXPECT_NEAR(static_cast<double>(rejection_count) / accuracy, 0.10, 0.01);
+}
+
+// Verify per-route response evaluator is used for success/failure evaluation.
+TEST_F(AdmissionControlTest, PerRouteResponseEvaluator) {
+  auto config = makeConfig(default_yaml_);
+  setupFilter(config);
+
+  AdmissionControlPerRouteProto per_route_proto;
+  TestUtility::loadFromYaml(R"EOF(
+admission_control:
+  success_criteria:
+    http_criteria:
+      http_success_status:
+        - start: 200
+          end: 300
+)EOF",
+                            per_route_proto);
+
+  auto per_route_evaluator = std::make_shared<MockResponseEvaluator>();
+  AdmissionControlPerRouteFilterConfig per_route_config(per_route_proto, runtime_,
+                                                        per_route_evaluator);
+
+  EXPECT_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+      .WillRepeatedly(Return(&per_route_config));
+  EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 100)));
+  EXPECT_CALL(controller_, averageRps()).WillRepeatedly(Return(99));
+
+  Http::TestRequestHeaderMapImpl request_headers;
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+
+  // The per-route evaluator should be used, not the global one.
+  EXPECT_CALL(*per_route_evaluator, isHttpSuccess(200)).WillOnce(Return(true));
+  EXPECT_CALL(*evaluator_, isHttpSuccess(200)).Times(0);
+  sampleHttpRequest("200");
+}
+
+// Verify per-route config can disable the filter while global is enabled.
+TEST_F(AdmissionControlTest, PerRouteDisabledWithGlobalEnabled) {
+  auto config = makeConfig(default_yaml_);
+  setupFilter(config);
+
+  AdmissionControlPerRouteProto per_route_proto;
+  TestUtility::loadFromYaml(R"EOF(
+admission_control:
+  enabled:
+    default_value: false
+    runtime_key: "per_route.enabled"
+  success_criteria:
+    http_criteria:
+    grpc_criteria:
+)EOF",
+                            per_route_proto);
+
+  AdmissionControlPerRouteFilterConfig per_route_config(per_route_proto, runtime_, nullptr);
+
+  EXPECT_CALL(decoder_callbacks_, mostSpecificPerFilterConfig())
+      .WillRepeatedly(Return(&per_route_config));
+
+  EXPECT_CALL(controller_, requestCounts()).Times(0);
+  EXPECT_CALL(controller_, averageRps()).Times(0);
+
+  Http::TestRequestHeaderMapImpl request_headers;
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+}
+
+// Verify no per-route config means global config is used.
+TEST_F(AdmissionControlTest, NoPerRouteConfig) {
+  auto config = makeConfig(default_yaml_);
+  setupFilter(config);
+
+  EXPECT_CALL(decoder_callbacks_, mostSpecificPerFilterConfig()).WillRepeatedly(Return(nullptr));
+  EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 0)));
+  EXPECT_CALL(controller_, averageRps()).WillRepeatedly(Return(99));
+
+  Http::TestRequestHeaderMapImpl request_headers;
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            filter_->decodeHeaders(request_headers, true));
+
+  EXPECT_TRUE(TestUtility::waitForCounterEq(store_, "test_prefix.rq_rejected", 1, time_system_));
+}
+
 } // namespace
 } // namespace AdmissionControl
 } // namespace HttpFilters
