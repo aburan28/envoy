@@ -554,7 +554,11 @@ void IoUringServerSocket::onRead(Request* req, int32_t result, bool injected, ui
     if (status_ == Closed && write_or_shutdown_req_ == nullptr && read_cancel_req_ == nullptr &&
         write_or_shutdown_cancel_req_ == nullptr) {
       if (result > 0 && keep_fd_open_) {
-        if (is_multishot && (flags & IORING_CQE_F_BUFFER)) {
+        if (is_multishot) {
+          // ``req`` is not a ``ReadRequest`` for a multishot completion, so it must never reach
+          // ``moveReadDataToBuffer`` below.
+          ASSERT(flags & IORING_CQE_F_BUFFER,
+                 "multishot recv completed with data but no buffer flag");
           const uint16_t bid = static_cast<uint16_t>(flags >> IORING_CQE_BUFFER_SHIFT);
           moveMultishotReadDataToBuffer(bid, result);
         } else {
