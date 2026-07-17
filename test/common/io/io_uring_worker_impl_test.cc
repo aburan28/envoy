@@ -422,8 +422,7 @@ TEST(IoUringWorkerImplTest, ServerCloseWithWriteRequestOnly) {
   io_uring_socket.disableRead();
   // Fake the read request finish.
   EXPECT_CALL(mock_io_uring, forEveryCompletion(_))
-      .WillOnce(
-          Invoke([&read_req](const CompletionCb& cb) { cb(read_req, -EAGAIN, false, 0); }));
+      .WillOnce(Invoke([&read_req](const CompletionCb& cb) { cb(read_req, -EAGAIN, false, 0); }));
   EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
   ASSERT_TRUE(file_event_callback(Event::FileReadyType::Read).ok());
 
@@ -494,8 +493,8 @@ TEST(IoUringWorkerImplTest, CloseDetected) {
   EXPECT_CALL(mock_io_uring, prepareReadv(_, _, _, _, _))
       .WillOnce(DoAll(SaveArg<4>(&read_req2), Return<IoUringResult>(IoUringResult::Ok)));
   EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
-  socket.onRead(read_req, 1, false);
-  socket.onRead(nullptr, 0, false);
+  socket.onRead(read_req, 1, false, 0);
+  socket.onRead(nullptr, 0, false, 0);
 
   EXPECT_CALL(dispatcher, clearDeferredDeleteList());
   delete read_req;
@@ -625,7 +624,7 @@ TEST(IoUringWorkerImplTest, CloseKeepFdOpenAndSaveData) {
   // Consumes the read request.
   EXPECT_CALL(mock_io_uring, removeInjectedCompletion(0));
   EXPECT_CALL(dispatcher, deferredDelete_);
-  socket.onRead(read_req, 1, false);
+  socket.onRead(read_req, 1, false, 0);
   EXPECT_TRUE(is_closed);
 
   EXPECT_CALL(dispatcher, clearDeferredDeleteList());
@@ -692,6 +691,275 @@ TEST(IoUringWorkerImplTest, NoEnableReadOnConnectError) {
 
   EXPECT_CALL(dispatcher, clearDeferredDeleteList());
   delete static_cast<Request*>(connect_req);
+}
+
+// A worker constructed with multishot recv enabled sets up the buf-ring once at startup and then
+// uses ``prepareRecvMultishot`` for each new server socket's read.
+class IoUringWorkerMultishotTestImpl : public IoUringWorkerImpl {
+public:
+  IoUringWorkerMultishotTestImpl(IoUringPtr io_uring_instance, Event::Dispatcher& dispatcher)
+      : IoUringWorkerImpl(std::move(io_uring_instance), 8192, 1000, dispatcher,
+                          /*enable_multishot_recv=*/true,
+                          /*multishot_recv_buffer_count=*/256) {}
+};
+
+TEST(IoUringWorkerImplTest, MultishotRecvSetupAndSubmit) {
+  Event::MockDispatcher dispatcher;
+  IoUringPtr io_uring_instance = std::make_unique<MockIoUring>();
+  MockIoUring& mock_io_uring = *dynamic_cast<MockIoUring*>(io_uring_instance.get());
+
+  // The worker calls ``setupBufRing`` exactly once at construction.
+  EXPECT_CALL(mock_io_uring, setupBufRing(0, 256, 8192))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, registerEventfd());
+  EXPECT_CALL(dispatcher,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType, Event::FileReadyType::Read))
+      .WillOnce(ReturnNew<NiceMock<Event::MockFileEvent>>());
+  IoUringWorkerMultishotTestImpl worker(std::move(io_uring_instance), dispatcher);
+  EXPECT_TRUE(worker.multishotRecvEnabled());
+
+  // Server socket's ``enableRead`` triggers ``submitReadRequest`` which routes to the multishot
+  // path.
+  Request* recv_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareRecvMultishot(42, 0, _))
+      .WillOnce(DoAll(SaveArg<2>(&recv_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  IoUringServerSocket socket(42, worker, [](uint32_t) { return absl::OkStatus(); }, 0, false);
+  socket.enableRead();
+  ASSERT_NE(nullptr, recv_req);
+  EXPECT_EQ(Request::RequestType::RecvMultishot, recv_req->type());
+
+  // The socket is constructed directly (not via ``addServerSocket``), so it is not in the
+  // worker's tracked sockets list and the worker destructor will not try to close it. We just
+  // need to release the in-flight request.
+  delete recv_req;
+  EXPECT_CALL(dispatcher, clearDeferredDeleteList());
+}
+
+// Falls back to the readv path when ``setupBufRing`` fails (older kernel).
+TEST(IoUringWorkerImplTest, MultishotRecvFallbackOnUnsupportedKernel) {
+  Event::MockDispatcher dispatcher;
+  IoUringPtr io_uring_instance = std::make_unique<MockIoUring>();
+  MockIoUring& mock_io_uring = *dynamic_cast<MockIoUring*>(io_uring_instance.get());
+
+  EXPECT_CALL(mock_io_uring, setupBufRing(0, 256, 8192))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Failed));
+  EXPECT_CALL(mock_io_uring, registerEventfd());
+  EXPECT_CALL(dispatcher,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType, Event::FileReadyType::Read))
+      .WillOnce(ReturnNew<NiceMock<Event::MockFileEvent>>());
+  IoUringWorkerMultishotTestImpl worker(std::move(io_uring_instance), dispatcher);
+  EXPECT_FALSE(worker.multishotRecvEnabled());
+
+  // ``submitReadRequest`` now picks the readv path.
+  Request* readv_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareReadv(42, _, _, _, _))
+      .WillOnce(DoAll(SaveArg<4>(&readv_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  IoUringServerSocket socket(42, worker, [](uint32_t) { return absl::OkStatus(); }, 0, false);
+  socket.enableRead();
+  ASSERT_NE(nullptr, readv_req);
+  EXPECT_EQ(Request::RequestType::Read, readv_req->type());
+
+  delete readv_req;
+  EXPECT_CALL(dispatcher, clearDeferredDeleteList());
+}
+
+// Falls back to the readv path when the kernel accepts buf-ring setup but rejects recv multishot.
+TEST(IoUringWorkerImplTest, MultishotRecvFallbackOnUnsupportedCompletion) {
+  Event::MockDispatcher dispatcher;
+  IoUringPtr io_uring_instance = std::make_unique<MockIoUring>();
+  MockIoUring& mock_io_uring = *dynamic_cast<MockIoUring*>(io_uring_instance.get());
+
+  EXPECT_CALL(mock_io_uring, setupBufRing(0, 256, 8192))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, registerEventfd());
+  EXPECT_CALL(dispatcher,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType, Event::FileReadyType::Read))
+      .WillOnce(ReturnNew<NiceMock<Event::MockFileEvent>>());
+  IoUringWorkerMultishotTestImpl worker(std::move(io_uring_instance), dispatcher);
+  EXPECT_TRUE(worker.multishotRecvEnabled());
+
+  Request* recv_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareRecvMultishot(42, 0, _))
+      .WillOnce(DoAll(SaveArg<2>(&recv_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+
+  bool read_event_fired = false;
+  IoUringServerSocket socket(
+      42, worker,
+      [&read_event_fired](uint32_t event) {
+        if (event & Event::FileReadyType::Read) {
+          read_event_fired = true;
+        }
+        return absl::OkStatus();
+      },
+      0, false);
+  socket.enableRead();
+  ASSERT_NE(nullptr, recv_req);
+
+  Request* readv_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareReadv(42, _, _, _, _))
+      .WillOnce(DoAll(SaveArg<4>(&readv_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+
+  socket.onRead(recv_req, -EINVAL, /*injected=*/false, /*flags=*/0);
+  EXPECT_FALSE(worker.multishotRecvEnabled());
+  EXPECT_FALSE(read_event_fired);
+  ASSERT_NE(nullptr, readv_req);
+  EXPECT_EQ(Request::RequestType::Read, readv_req->type());
+
+  delete recv_req;
+  delete readv_req;
+  EXPECT_CALL(dispatcher, clearDeferredDeleteList());
+}
+
+// A multishot completion with ``F_BUFFER | F_MORE`` delivers the buffer to the upper layer and
+// keeps the SQE armed (no re-arm via ``prepareRecvMultishot``).
+TEST(IoUringWorkerImplTest, MultishotRecvDeliversBufferAndStaysArmed) {
+  Event::MockDispatcher dispatcher;
+  IoUringPtr io_uring_instance = std::make_unique<MockIoUring>();
+  MockIoUring& mock_io_uring = *dynamic_cast<MockIoUring*>(io_uring_instance.get());
+
+  EXPECT_CALL(mock_io_uring, setupBufRing(0, 256, 8192))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, registerEventfd());
+  EXPECT_CALL(dispatcher,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType, Event::FileReadyType::Read))
+      .WillOnce(ReturnNew<NiceMock<Event::MockFileEvent>>());
+  IoUringWorkerMultishotTestImpl worker(std::move(io_uring_instance), dispatcher);
+
+  Request* recv_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareRecvMultishot(42, 0, _))
+      .WillOnce(DoAll(SaveArg<2>(&recv_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+
+  bool read_event_fired = false;
+  IoUringServerSocket socket(
+      42, worker,
+      [&read_event_fired, &socket](uint32_t event) {
+        if (event & Event::FileReadyType::Read) {
+          read_event_fired = true;
+          // Drain so the buffer fragment's release callback fires and the buf is recycled.
+          socket.getReadBuffer().drain(socket.getReadBuffer().length());
+        }
+        return absl::OkStatus();
+      },
+      0, false);
+  socket.enableRead();
+  ASSERT_NE(nullptr, recv_req);
+
+  // Kernel-side: arrange for ``getBufferForBid`` to return a known buffer; ``recycleBuffer`` will
+  // be called when the upper layer drains.
+  uint8_t kernel_buffer[16] = {'h', 'e', 'l', 'l', 'o', 0};
+  EXPECT_CALL(mock_io_uring, getBufferForBid(0, 7)).WillOnce(Return(kernel_buffer));
+  EXPECT_CALL(mock_io_uring, recycleBuffer(0, 7));
+
+  // Build the flags: F_BUFFER + F_MORE, with bid 7 in the upper bits.
+  const uint32_t flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (7u << IORING_CQE_BUFFER_SHIFT);
+  socket.onRead(recv_req, /*result=*/5, /*injected=*/false, flags);
+  EXPECT_TRUE(read_event_fired);
+
+  delete recv_req;
+  EXPECT_CALL(dispatcher, clearDeferredDeleteList());
+}
+
+// A multishot completion with ``F_BUFFER`` but ``F_MORE`` clear means the SQE has terminated; the
+// worker must re-arm by submitting another ``prepareRecvMultishot``.
+TEST(IoUringWorkerImplTest, MultishotRecvReArmOnFMoreClear) {
+  Event::MockDispatcher dispatcher;
+  IoUringPtr io_uring_instance = std::make_unique<MockIoUring>();
+  MockIoUring& mock_io_uring = *dynamic_cast<MockIoUring*>(io_uring_instance.get());
+
+  EXPECT_CALL(mock_io_uring, setupBufRing(0, 256, 8192))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, registerEventfd());
+  EXPECT_CALL(dispatcher,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType, Event::FileReadyType::Read))
+      .WillOnce(ReturnNew<NiceMock<Event::MockFileEvent>>());
+  IoUringWorkerMultishotTestImpl worker(std::move(io_uring_instance), dispatcher);
+
+  Request* recv_req1 = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareRecvMultishot(42, 0, _))
+      .WillOnce(DoAll(SaveArg<2>(&recv_req1), Return<IoUringResult>(IoUringResult::Ok)))
+      .RetiresOnSaturation();
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+
+  IoUringServerSocket socket(42, worker, [](uint32_t) { return absl::OkStatus(); }, 0, false);
+  socket.enableRead();
+  ASSERT_NE(nullptr, recv_req1);
+
+  // Completion with F_BUFFER but no F_MORE: SQE has terminated, expect a fresh
+  // ``prepareRecvMultishot`` to re-arm.
+  uint8_t kernel_buffer[16] = {0};
+  EXPECT_CALL(mock_io_uring, getBufferForBid(0, 3)).WillOnce(Return(kernel_buffer));
+  EXPECT_CALL(mock_io_uring, recycleBuffer(0, 3));
+  Request* recv_req2 = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareRecvMultishot(42, 0, _))
+      .WillOnce(DoAll(SaveArg<2>(&recv_req2), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+
+  const uint32_t flags = IORING_CQE_F_BUFFER | (3u << IORING_CQE_BUFFER_SHIFT); // F_MORE clear
+  socket.onRead(recv_req1, /*result=*/4, /*injected=*/false, flags);
+  EXPECT_NE(nullptr, recv_req2);
+  EXPECT_NE(recv_req1, recv_req2);
+  // Drain so the recycle callback fires.
+  socket.getReadBuffer().drain(socket.getReadBuffer().length());
+
+  delete recv_req1;
+  delete recv_req2;
+  EXPECT_CALL(dispatcher, clearDeferredDeleteList());
+}
+
+// During keep-fd-open close (used by cross-thread migration), any unread multishot fragments are
+// copied out before the buffer is handed to the next socket so the old worker's buf-ring is not
+// referenced from the new worker.
+TEST(IoUringWorkerImplTest, MultishotRecvCopiesUnreadDataBeforeKeepFdOpenClose) {
+  Event::MockDispatcher dispatcher;
+  IoUringPtr io_uring_instance = std::make_unique<MockIoUring>();
+  MockIoUring& mock_io_uring = *dynamic_cast<MockIoUring*>(io_uring_instance.get());
+
+  EXPECT_CALL(mock_io_uring, setupBufRing(0, 256, 8192))
+      .WillOnce(Return<IoUringResult>(IoUringResult::Ok));
+  EXPECT_CALL(mock_io_uring, registerEventfd());
+  EXPECT_CALL(dispatcher,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType, Event::FileReadyType::Read))
+      .WillOnce(ReturnNew<NiceMock<Event::MockFileEvent>>());
+  IoUringWorkerMultishotTestImpl worker(std::move(io_uring_instance), dispatcher);
+
+  Request* recv_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareRecvMultishot(42, 0, _))
+      .WillOnce(DoAll(SaveArg<2>(&recv_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  auto& socket = worker.addServerSocket(42, [](uint32_t) { return absl::OkStatus(); }, false);
+  ASSERT_NE(nullptr, recv_req);
+
+  Request* cancel_req = nullptr;
+  EXPECT_CALL(mock_io_uring, prepareCancel(recv_req, _))
+      .WillOnce(DoAll(SaveArg<1>(&cancel_req), Return<IoUringResult>(IoUringResult::Ok)));
+  EXPECT_CALL(mock_io_uring, submit()).Times(1).RetiresOnSaturation();
+  bool is_closed = false;
+  socket.close(true, [&is_closed](Buffer::Instance& read_buffer) {
+    EXPECT_EQ(5, read_buffer.length());
+    EXPECT_EQ("hello", read_buffer.toString());
+    is_closed = true;
+  });
+
+  socket.onCancel(cancel_req, 0, false);
+
+  uint8_t kernel_buffer[16] = {'h', 'e', 'l', 'l', 'o'};
+  EXPECT_CALL(mock_io_uring, getBufferForBid(0, 9)).WillOnce(Return(kernel_buffer));
+  EXPECT_CALL(mock_io_uring, recycleBuffer(0, 9));
+  EXPECT_CALL(mock_io_uring, removeInjectedCompletion(42));
+  EXPECT_CALL(dispatcher, deferredDelete_);
+
+  const uint32_t flags = IORING_CQE_F_BUFFER | (9u << IORING_CQE_BUFFER_SHIFT); // F_MORE clear
+  socket.onRead(recv_req, /*result=*/5, /*injected=*/false, flags);
+  EXPECT_TRUE(is_closed);
+
+  delete recv_req;
+  delete cancel_req;
+  EXPECT_CALL(dispatcher, clearDeferredDeleteList());
 }
 
 } // namespace
